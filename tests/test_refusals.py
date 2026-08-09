@@ -36,6 +36,6 @@ def test_missing_secrets_refused(backend, command_cls):
 
 def test_send_callback_also_refuses_unknown_speaker(backend):
     set_current_user_id(None)
-    response = DraftReplyCommand().send_draft({"selected": []}, request_info(user_id=None))
+    response = DraftReplyCommand().send_draft({"ref_id": "draft:x"}, request_info(user_id=None))
     assert response.success is False
     assert response.context_data["error"] == "unknown_speaker"

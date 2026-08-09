@@ -1,4 +1,6 @@
-"""The send approval callback: stored-draft-only, honest status mapping."""
+"""The phone-tap callbacks: stored-draft-only sends, honest status mapping,
+dismiss drops the draft. Data arrives as the inbox element's data dict
+({"ref_id": ...}) — there is deliberately NO voice path to these."""
 
 from commands.draft_reply.command import DraftReplyCommand
 from messages_shared.drafting import draft_ref_id
@@ -14,10 +16,7 @@ def _stored_draft(chat_id="cS", label="Sarah", text="Be there in 10!"):
 
 
 def _send(command, ref_id):
-    return command.send_draft(
-        {"action": "send", "selected": [{"key": ref_id, "chat_id": "cS", "label": "Sarah"}]},
-        request_info(),
-    )
+    return command.send_draft({"ref_id": ref_id}, request_info())
 
 
 def test_sends_stored_text_never_llm_text(speaker, osx):
@@ -26,7 +25,7 @@ def test_sends_stored_text_never_llm_text(speaker, osx):
     assert response.success
     assert osx.send_calls == [("cS", "Exact stored draft.")]
     assert response.context_data["message"] == "Sent to Sarah."
-    # spent: a second "send it" must not double-send
+    # spent: a second tap must not double-send
     assert storage().get(ref_id) is None
 
 
@@ -59,6 +58,13 @@ def test_expired_draft(speaker, osx):
     assert osx.send_calls == []
 
 
+def test_missing_ref_id(speaker, osx):
+    response = DraftReplyCommand().send_draft({}, request_info())
+    assert response.success is False
+    assert response.context_data["error"] == "no_selection"
+    assert osx.send_calls == []
+
+
 def test_unreachable_mac_says_nothing_was_sent(speaker, osx):
     from tests.conftest import unreachable
 
@@ -67,3 +73,25 @@ def test_unreachable_mac_says_nothing_was_sent(speaker, osx):
     response = _send(DraftReplyCommand(), ref_id)
     assert response.success is False
     assert "nothing was sent" in response.context_data["message"]
+
+
+class TestDismiss:
+    def test_dismiss_drops_stored_draft(self, backend):
+        ref_id = _stored_draft()
+        response = DraftReplyCommand().dismiss_draft({"ref_id": ref_id}, request_info())
+        assert response.success
+        assert response.context_data["message"] == "Discarded the draft to Sarah."
+        assert storage().get(ref_id) is None
+
+    def test_dismiss_is_idempotent(self, backend):
+        response = DraftReplyCommand().dismiss_draft({"ref_id": "draft:ghost"}, request_info())
+        assert response.success
+        assert response.context_data["message"] == "That draft was already gone."
+
+    def test_dismissed_draft_cannot_be_sent(self, speaker, osx):
+        ref_id = _stored_draft()
+        DraftReplyCommand().dismiss_draft({"ref_id": ref_id}, request_info())
+        response = _send(DraftReplyCommand(), ref_id)
+        assert response.success is False
+        assert response.context_data["error"] == "draft_expired"
+        assert osx.send_calls == []

@@ -10,6 +10,7 @@ import types
 import pytest
 from jarvis_command_sdk import RequestInformation
 from jarvis_command_sdk.context import set_current_user_id
+from jarvis_command_sdk.inbox import InboxBackend, get_inbox_backend, set_inbox_backend
 from jarvis_command_sdk.storage import StorageBackend, get_backend, set_backend
 
 from messages_shared.osx_client import API_KEY_SECRET, INSTANCE_URL_SECRET, OsxApiError
@@ -156,6 +157,33 @@ def osx(monkeypatch):
     client = FakeOsxClient()
     monkeypatch.setattr("messages_shared.guards.client_from_storage", lambda _storage: client)
     return client
+
+
+class FakeInboxBackend(InboxBackend):
+    """Captures posted cards so tests can assert the phone confirmation."""
+
+    def __init__(self) -> None:
+        self.posts: list[dict] = []
+
+    def post_inbox_item(
+        self, command_name, *, title, summary="", body="", category="general",
+        metadata=None, user_id=None, create_push_notification=False, target_type="household",
+    ):
+        self.posts.append({
+            "command_name": command_name, "title": title, "summary": summary,
+            "body": body, "category": category, "metadata": metadata,
+            "user_id": user_id, "push": create_push_notification, "target_type": target_type,
+        })
+        return "ok"
+
+
+@pytest.fixture
+def inbox():
+    prev = get_inbox_backend()
+    fake = FakeInboxBackend()
+    set_inbox_backend(fake)
+    yield fake
+    set_inbox_backend(prev)  # type: ignore[arg-type]
 
 
 @pytest.fixture

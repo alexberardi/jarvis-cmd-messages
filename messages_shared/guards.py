@@ -71,4 +71,10 @@ class ThreadCallbacksMixin:
         if refusal:
             return refusal
         chat_id, label = _selected_chat(data)
-        return draft_flow(client, chat_id=chat_id, label=label, instruction=None)
+        return draft_flow(
+            client,
+            chat_id=chat_id,
+            label=label,
+            instruction=None,
+            user_id=resolve_speaker(request_info),
+        )
