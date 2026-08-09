@@ -1,0 +1,36 @@
+name: "messages"
+display_name: "Messages (iMessage)"
+description: "Check, read, and reply to iMessages by voice through a jarvis-osx-api instance running on the user's Mac. Sending is always draft -> voice-approve -> send; nothing is ever sent automatically."
+version: "0.1.0"
+min_jarvis_version: "0.1.115"
+# SDK 0.4.1: same floor as medication — user-scoped secrets (value picker,
+# scope enforcement) plus the callback/act_on_items machinery this bundle
+# leans on for "read the one from Sarah" and the send approval.
+min_sdk_version: "0.4.1"
+license: "Apache-2.0"
+author:
+  github: "alexberardi"
+categories: ["communication", "productivity"]
+# The NODE can be any platform — it talks to the user's Mac over HTTP. The
+# macOS constraint lives in jarvis-osx-api (the service), not here.
+platforms: ["darwin", "linux"]
+keywords: ["text", "texts", "imessage", "message", "messages", "reply", "sms"]
+
+packages:
+  - requests
+
+# Per-user speaker->instance binding (PRD decision #9): the recognized
+# speaker's own secrets resolve automatically (scope: user); a speaker with
+# neither set is hard-refused by every verb.
+secrets:
+  - key: user_osx_api_instance_url
+    scope: user
+    value_type: string
+    description: "URL of your Mac's jarvis-osx-api instance, e.g. http://alexs-mac.local:7723"
+    friendly_name: "Mac bridge URL"
+    is_sensitive: false
+  - key: user_osx_api_api_key
+    scope: user
+    value_type: string
+    description: "API key minted on the Mac (python cli.py generate-api-key)"
+    friendly_name: "Mac bridge API key"
