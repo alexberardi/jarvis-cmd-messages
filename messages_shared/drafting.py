@@ -1,49 +1,64 @@
-"""Draft composition + storage + phone confirmation card.
+"""Draft composition, storage, voice-send, and the editable phone card.
 
 The draft is composed HERE, in the command layer, via the node runtime's
 generic `ask_llm` primitive (node -> CC /api/v0/node/llm/chat -> llm-proxy),
 and the EXACT text is stored in JarvisStorage keyed by ref_id.
 
-Sending is NEVER voice-approved (PRD revised decision #5): the confirmation is
-a human tap on the phone. The verified dispatch chain for that tap:
+Send confirmation (PRD decisions #5/#14, final): the draft turn reads the
+draft verbatim and asks "want me to send this, or edit it yourself?".
+- Spoken "send" -> act_on_items dispatches the "send" callback. The node's
+  destructive-action gate allows it because the draft item's RECORDED attrs
+  carry `confirm_offered: True` (jarvis-node-setup
+  command_execution_service.py — the flag is command-controlled; we set it
+  precisely because this turn offered the send as a direct question, making
+  the user's reply the confirmation). The send uses the STORED draft text.
+- Spoken "edit" -> the "edit" callback posts an EDITABLE card to the
+  speaker's phone; its Send tap delivers the human-edited text.
 
-1. This module posts an inbox card with Send/Dismiss buttons:
-   `JarvisInbox.post(interactive_elements=...)` — jarvis-command-sdk
-   inbox.py:108; each element names {command, callback, data} (inbox.py:34-51).
-   The node backend (jarvis-node-setup services/inbox_backend.py) relays it to
-   command-center -> jarvis-notifications -> the speaker's phone
-   (target_type="user" + user_id).
-2. Tap on the phone -> POST to command-center -> CC publishes the job id over
-   MQTT; the node's handle_callback (jarvis-node-setup
-   scripts/mqtt_tts_listener.py:300) fetches the full
-   {command_name, callback_name, data, user_id} payload over authenticated
-   HTTPS, sets the SDK user context (set_current_user_id, :384 — so the
-   speaker's user-scoped osx-api secrets resolve), and invokes
-   `command.get_callbacks()[callback](data, request_info)`.
-3. That lands in DraftReplyCommand.send_draft / dismiss_draft with the
-   element's `data` dict verbatim ({"ref_id": ...}).
+Editable-card round-trip (email bundle pattern, verified):
+`metadata.editable_text = {label, initial, data_key}` seeds the mobile editor
+(jarvis-cmd-email email_shared/reply_drafts.py:203-209); on tap, mobile
+substitutes the live editor text into `data[data_key]` for elements whose
+data contains that key (reply_drafts.py:183-188 — Send carries it, Dismiss
+doesn't), and the callback reads it from its data payload
+(jarvis-cmd-email commands/email/command.py:1727). We use data_key "text".
 
-Same chain the email bundle's Send/Ignore reply cards use
-(jarvis-cmd-email email_shared/reply_drafts.py:171).
+Tap dispatch chain (same as email's reply cards): JarvisInbox
+interactive_elements (sdk inbox.py:34-51,108) -> CC -> notifications -> tap ->
+node handle_callback (jarvis-node-setup scripts/mqtt_tts_listener.py:300)
+fetches {command_name, callback_name, data, user_id}, sets the SDK user
+context (:384), and invokes the @callback with the element data verbatim.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from jarvis_command_sdk import CommandResponse, JarvisInbox
+from jarvis_command_sdk import CommandResponse, JarvisInbox, ReferenceableItem
 
 from .osx_client import OsxApiClient, OsxApiError
 from .speaker import service_error_response
 from .threads import LAST_THREAD_KEY, storage
 
-_DRAFT_TTL = timedelta(minutes=30)  # tap can lag speech; outlive a slow pickup
+_DRAFT_TTL = timedelta(minutes=30)  # phone pickup can lag the voice turn
 _THREAD_TAIL = 8
 
 _SYSTEM_PROMPT = (
     "You draft short text-message replies on the user's behalf. "
     "Reply with ONLY the message text — no quotes, no preamble, no sign-off."
 )
+
+_SEND_SPOKEN = {
+    "sent": "Sent to {label}.",
+    "unverified": (
+        "I asked Messages to send it, but I couldn't confirm it actually went "
+        "through — better double-check on your Mac or phone."
+    ),
+    "send_failed": "Messages reported an error sending it — it didn't go through.",
+    "group_unsupported": "I can't send to group chats yet — only one-on-one conversations.",
+    "no_such_chat": "I couldn't find that conversation on your Mac to send to.",
+    "applescript_error": "Your Mac refused the send — it may need the Automation permission re-granted.",
+}
 
 
 def draft_ref_id(chat_id: str) -> str:
@@ -91,48 +106,11 @@ def compose_prompt(thread: dict, style: dict, label: str, instruction: str | Non
     )
 
 
-def post_confirmation_card(user_id: int | None, ref_id: str, label: str, draft: str) -> str:
-    """Send/Dismiss tap card to the speaker's phone. Returns the inbox tag
-    ("ok" on success — see jarvis_command_sdk/inbox.py docstring)."""
-    elements = [
-        {
-            "id": f"send-{ref_id}",
-            "label": "Send",
-            "kind": "send",
-            "command": "draft_reply",
-            "callback": "send",
-            "data": {"ref_id": ref_id},
-            # stack: poll + show the send result inline (the honest
-            # sent/unverified phrasing from the callback).
-            "navigation_type": "stack",
-        },
-        {
-            # No navigation_type => fire-and-forget; the chip just checks off.
-            "id": f"dismiss-{ref_id}",
-            "label": "Dismiss",
-            "command": "draft_reply",
-            "callback": "dismiss_draft",
-            "data": {"ref_id": ref_id},
-        },
-    ]
-    return JarvisInbox("draft_reply").post(
-        title=f"Text reply ready — {label}",
-        summary="Tap Send to deliver it",
-        body=f"To: {label}\n\n{draft}",
-        category="general",
-        interactive_elements=elements,
-        user_id=user_id,
-        target_type="user",
-        create_push_notification=True,
-    )
-
-
 def draft_flow(
     client: OsxApiClient,
     chat_id: str | None,
     label: str | None,
     instruction: str | None,
-    user_id: int | None,
 ) -> CommandResponse:
     store = storage()
     if not chat_id:
@@ -172,29 +150,163 @@ def draft_flow(
         expires_at=datetime.now(timezone.utc) + _DRAFT_TTL,
     )
 
-    tag = post_confirmation_card(user_id, ref_id, label, draft)
-    if tag != "ok":
-        # No card = no way to confirm = nothing can be sent. Say so honestly;
-        # the stored draft survives so a retry can just re-post the card.
+    # The direct question makes the follow-up the confirmation: this exact turn
+    # is why the item may carry confirm_offered=True (the node's destructive
+    # gate dispatches "send" only for items recorded with the flag). No card is
+    # posted here — the phone card exists only on the "edit" path.
+    message = (
+        f"Here's the draft to {label}: \"{draft}\" — "
+        "want me to send this, or edit it yourself?"
+    )
+    return CommandResponse.with_items(
+        message,
+        [
+            ReferenceableItem(
+                ref_id=ref_id,
+                label=f"draft reply to {label}",
+                attrs={"chat_id": chat_id, "label": label, "confirm_offered": True},
+                actions=["send", "edit"],
+            )
+        ],
+        context_data={"chat_id": chat_id, "draft": draft},
+    )
+
+
+def send_by_ref(client: OsxApiClient, ref_id: str | None, text_override: str | None = None) -> CommandResponse:
+    """Single send implementation behind both entry points (voice + phone tap).
+
+    ``text_override`` is the phone editor's text (tap path only — mobile
+    substitutes it into the element data at tap time). Human edits are allowed
+    by the exact-text rule: it forbids LLM re-emission of the draft, not human
+    authorship. The voice path never carries an override, so it always sends
+    the STORED draft verbatim.
+    """
+    if not ref_id:
         return CommandResponse.error_response(
-            error_details=f"confirmation card post failed: {tag}",
+            error_details="send without ref_id",
+            context_data={"error": "no_selection", "message": "I'm not sure which draft to send."},
+        )
+    record = storage().get(ref_id)
+    if not record or not record.get("draft"):
+        return CommandResponse.error_response(
+            error_details=f"No stored draft for ref_id {ref_id!r} (expired?)",
             context_data={
-                "error": "card_post_failed",
-                "message": (
-                    f"I drafted a reply to {label}, but I couldn't get the "
-                    "confirmation to your phone — nothing was sent. Try again in a moment."
-                ),
+                "error": "draft_expired",
+                "message": "That draft has expired — ask me to draft the reply again.",
             },
         )
 
-    # No referenceable send action ON PURPOSE: sending is tap-only (revised
-    # decision #5); voice must not even be offered a "send" verb the node's
-    # destructive-action gate would refuse.
-    message = (
-        f"Here's the draft to {label}: \"{draft}\" — "
-        "I've sent it to your phone; tap Send to deliver it."
+    label = record.get("label") or "them"
+    text = (text_override or "").strip() or record["draft"]
+    try:
+        result = client.send(record["chat_id"], text)
+    except OsxApiError as exc:
+        return CommandResponse.error_response(
+            error_details=str(exc),
+            context_data={
+                "error": "osx_api_unreachable",
+                "message": "I couldn't reach your Mac to send it — nothing was sent.",
+            },
+        )
+
+    status = result.get("status")
+    spoken = _SEND_SPOKEN.get(status, f"Sending failed ({status}).").format(label=label)
+    if status == "sent":
+        storage().delete(ref_id)  # spent — a second "send it"/tap must not double-send
+        return CommandResponse.success_response(
+            context_data={"message": spoken, "status": status}, wait_for_input=False
+        )
+    return CommandResponse.error_response(
+        error_details=f"send returned status={status}: {result.get('detail')}",
+        context_data={"error": status, "message": spoken},
     )
+
+
+def edit_flow(user_id: int | None, ref_id: str | None) -> CommandResponse:
+    """Voice "edit" -> push the EDITABLE card to the speaker's phone."""
+    record = storage().get(ref_id) if ref_id else None
+    if not record or not record.get("draft"):
+        return CommandResponse.error_response(
+            error_details=f"No stored draft for ref_id {ref_id!r} (expired?)",
+            context_data={
+                "error": "draft_expired",
+                "message": "That draft has expired — ask me to draft the reply again.",
+            },
+        )
+    label = record.get("label") or "them"
+    tag = post_editable_card(user_id, ref_id, label, record["draft"])
+    if tag != "ok":
+        return CommandResponse.error_response(
+            error_details=f"editable card post failed: {tag}",
+            context_data={
+                "error": "card_post_failed",
+                "message": (
+                    "I couldn't get the draft to your phone — nothing was sent. "
+                    "You can still tell me to send it as is."
+                ),
+            },
+        )
     return CommandResponse.success_response(
-        context_data={"message": message, "chat_id": chat_id, "draft": draft},
+        context_data={
+            "message": "Okay — it's on your phone. Edit it there and tap Send when it's ready.",
+        },
         wait_for_input=False,
     )
+
+
+def post_editable_card(user_id: int | None, ref_id: str, label: str, draft: str) -> str:
+    """Editable Send/Dismiss card. Returns the inbox tag ("ok" on success).
+
+    The draft is seeded into the mobile editor via metadata.editable_text; the
+    Send element's data carries the "text" data_key so the tap substitutes the
+    edited value (email's reply-card pattern). Dismiss's data has no "text"
+    key, so it never picks up editor content.
+    """
+    elements = [
+        {
+            "id": f"send-{ref_id}",
+            "label": "Send",
+            "kind": "send",
+            "command": "draft_reply",
+            "callback": "send",
+            "data": {"ref_id": ref_id, "text": draft},
+            # stack: poll + show the send result inline (the honest
+            # sent/unverified phrasing from send_by_ref).
+            "navigation_type": "stack",
+        },
+        {
+            # No navigation_type => fire-and-forget; the chip just checks off.
+            "id": f"dismiss-{ref_id}",
+            "label": "Dismiss",
+            "command": "draft_reply",
+            "callback": "dismiss_draft",
+            "data": {"ref_id": ref_id},
+        },
+    ]
+    return JarvisInbox("draft_reply").post(
+        title=f"Text reply ready — {label}",
+        summary="Edit if you like, then tap Send",
+        body=f"To: {label}",
+        category="general",
+        metadata={
+            "editable_text": {
+                "label": "Draft reply",
+                "initial": draft,
+                "data_key": "text",
+            },
+        },
+        interactive_elements=elements,
+        user_id=user_id,
+        target_type="user",
+        create_push_notification=True,
+    )
+
+
+def dismiss_by_ref(ref_id: str | None) -> CommandResponse:
+    """Drop a stored draft. Idempotent (double-tap / expired still succeeds)."""
+    record = storage().get(ref_id) if ref_id else None
+    if ref_id:
+        storage().delete(ref_id)
+    label = (record or {}).get("label") or "them"
+    message = f"Discarded the draft to {label}." if record else "That draft was already gone."
+    return CommandResponse.success_response(context_data={"message": message}, wait_for_input=False)

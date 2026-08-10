@@ -34,8 +34,10 @@ def test_missing_secrets_refused(backend, command_cls):
     assert "isn't linked" in response.context_data["message"]
 
 
-def test_send_callback_also_refuses_unknown_speaker(backend):
+def test_send_and_edit_callbacks_also_refuse_unknown_speaker(backend):
     set_current_user_id(None)
-    response = DraftReplyCommand().send_draft({"ref_id": "draft:x"}, request_info(user_id=None))
-    assert response.success is False
-    assert response.context_data["error"] == "unknown_speaker"
+    callbacks = DraftReplyCommand().get_callbacks()
+    for name in ("send", "edit"):
+        response = callbacks[name]({"ref_id": "draft:x"}, request_info(user_id=None))
+        assert response.success is False, name
+        assert response.context_data["error"] == "unknown_speaker", name

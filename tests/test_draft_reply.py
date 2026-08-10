@@ -2,7 +2,7 @@ from commands.draft_reply.command import DraftReplyCommand
 from messages_shared.drafting import draft_ref_id
 from messages_shared.threads import LAST_THREAD_KEY, storage
 
-from tests.conftest import SPEAKER, chat, message, request_info
+from tests.conftest import chat, message, request_info
 
 
 def _seed_last_thread(osx, chat_id="cS", label="Sarah"):
@@ -15,7 +15,7 @@ def _seed_last_thread(osx, chat_id="cS", label="Sarah"):
     osx.styles[chat_id] = {"messages": ["omw!", "yeah for sure", "lol ok"], "sparse": False}
 
 
-def test_draft_stored_exactly_and_spoken_points_at_phone(speaker, osx, inbox, fake_ask_llm):
+def test_draft_stored_exactly_and_spoken_offers_send_or_edit(speaker, osx, inbox, fake_ask_llm):
     _seed_last_thread(osx)
     fake_ask_llm["state"]["reply"] = '"Yes! Be there at 8."'
     response = DraftReplyCommand().run(request_info(), instruction="say yes, 8pm")
@@ -24,36 +24,23 @@ def test_draft_stored_exactly_and_spoken_points_at_phone(speaker, osx, inbox, fa
     assert stored["draft"] == "Yes! Be there at 8."  # noise-stripped, exact
     message_text = response.context_data["message"]
     assert '"Yes! Be there at 8."' in message_text
-    assert "tap Send to deliver it" in message_text
-    # tap-only confirmation (revised decision #5): no voice-actionable items at all
-    assert not response.referenceable_items
+    assert message_text.endswith("want me to send this, or edit it yourself?")
+    # No card on the voice path — the phone card exists only via "edit".
+    assert inbox.posts == []
 
 
-def test_confirmation_card_reaches_the_speakers_phone(speaker, osx, inbox, fake_ask_llm):
-    _seed_last_thread(osx)
-    fake_ask_llm["state"]["reply"] = "Be there soon!"
-    DraftReplyCommand().run(request_info())
-    assert len(inbox.posts) == 1
-    post = inbox.posts[0]
-    assert post["user_id"] == SPEAKER
-    assert post["target_type"] == "user"
-    assert post["push"] is True
-    assert "Sarah" in post["title"]
-    assert "Be there soon!" in post["body"]
-    elements = post["metadata"]["interactive_elements"]
-    assert [e["callback"] for e in elements] == ["send", "dismiss_draft"]
-    assert all(e["command"] == "draft_reply" for e in elements)
-    assert all(e["data"] == {"ref_id": draft_ref_id("cS")} for e in elements)
-
-
-def test_card_post_failure_is_honest_and_keeps_draft(speaker, osx, fake_ask_llm):
-    # No inbox fixture -> post() returns "no_backend" -> no way to confirm.
+def test_draft_item_carries_confirm_offered_and_both_actions(speaker, osx, inbox, fake_ask_llm):
+    """The direct question in the spoken turn is what licenses the flag: the
+    node's destructive gate dispatches voice "send" only for RECORDED items
+    with confirm_offered=True."""
     _seed_last_thread(osx)
     response = DraftReplyCommand().run(request_info())
-    assert response.success is False
-    assert response.context_data["error"] == "card_post_failed"
-    assert "nothing was sent" in response.context_data["message"]
-    assert storage().get(draft_ref_id("cS")) is not None  # retry can re-post
+    items = response.referenceable_items
+    assert len(items) == 1
+    item = items[0]
+    assert item.ref_id == draft_ref_id("cS")
+    assert item.actions == ["send", "edit"]
+    assert item.attrs == {"chat_id": "cS", "label": "Sarah", "confirm_offered": True}
 
 
 def test_prompt_carries_style_thread_and_instruction(speaker, osx, inbox, fake_ask_llm):
@@ -79,7 +66,7 @@ def test_ask_llm_unavailable_fails_closed(speaker, osx, inbox):
     assert response.success is False
     assert response.context_data["error"] == "draft_failed"
     assert storage().get(draft_ref_id("cS")) is None
-    assert inbox.posts == []  # no card without a draft
+    assert inbox.posts == []
 
 
 def test_no_thread_context(speaker, osx, inbox, fake_ask_llm):
@@ -97,4 +84,4 @@ def test_contact_resolves_via_unread(speaker, osx, inbox, fake_ask_llm):
     response = DraftReplyCommand().run(request_info(), contact="Mom", instruction="I'll call tonight")
     assert response.success
     assert storage().get(draft_ref_id("cM"))["label"] == "Mom"
-    assert inbox.posts[0]["title"] == "Text reply ready — Mom"
+    assert response.referenceable_items[0].attrs["confirm_offered"] is True

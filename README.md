@@ -6,25 +6,29 @@ the speaker's Mac. Design doc: `jarvis/prds/osx-api.md`.
 **The loop:** "any new texts?" → `check_texts` → "read the one from Sarah" →
 `read_thread` (marks read-aloud only AFTER speaking) → "reply that I'm running
 late" → `draft_reply` composes via the node's `ask_llm`, stores the exact
-draft by ref_id, speaks it, and posts a **Send/Dismiss card to the speaker's
-phone**. **Nothing is ever sent by voice alone** (PRD revised decision #5) —
-the human tap on Send is the confirmation; the `@callback("send")` re-fetches
-the stored draft and only a chat.db-verified send is ever reported as "Sent."
-Dismiss drops the stored draft.
+draft by ref_id, reads it verbatim, and asks **"want me to send this, or edit
+it yourself?"**:
+
+- **"Send"** — delivered immediately by voice. The read-aloud + direct
+  question is the confirmation: the draft item is recorded with
+  `confirm_offered: True`, which is what the node's destructive-action gate
+  requires to dispatch a voice `send` (jarvis-node-setup PR #104). The voice
+  path always sends the STORED draft verbatim.
+- **"Edit"** — an editable card is pushed to the speaker's phone (email's
+  `editable_text` pattern); its Send tap delivers the human-edited text.
+  Dismiss drops the stored draft.
+
+Only a chat.db-verified send is ever reported as "Sent"; every other status
+(unverified/failed/group) is phrased honestly.
 
 **Speaker binding (per-user secrets, hard refusal without them):**
 `user_osx_api_instance_url` + `user_osx_api_api_key` — set per user in the app;
 secrets are node-local.
-
-**Permanent guard:** the node's destructive-action gate refuses voice `send`
-forever — by design. No item in this bundle advertises a send action to voice;
-the inbox tap card (same chain as the email bundle's reply cards) is the only
-send path.
 
 ## Tests
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e ../jarvis-command-sdk requests pytest
-.venv/bin/python -m pytest -q   # 41 tests, no network / no node runtime needed
+.venv/bin/python -m pytest -q   # 46 tests, no network / no node runtime needed
 ```
